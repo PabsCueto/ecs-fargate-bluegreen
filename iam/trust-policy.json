@@ -9,10 +9,8 @@
       "Action": "sts:AssumeRoleWithWebIdentity",
       "Condition": {
         "StringEquals": {
-          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
-        },
-        "StringLike": {
-          "token.actions.githubusercontent.com:sub": "repo:PabsCueto/ecs-fargate-bluegreen:ref:refs/heads/main"
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+          "token.actions.githubusercontent.com:sub": "repo:PabsCueto@203713710/ecs-fargate-bluegreen@1398849777:ref:refs/heads/main"
         }
       }
     }

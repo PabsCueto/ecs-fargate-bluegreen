@@ -20,26 +20,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # TEMPORAL: borrar cuando el login con OIDC funcione.
-      # Imprime los claims del token (no el token) para comparar el "sub"
-      # real con el de la política de confianza del rol.
-      - name: Debug OIDC claims
-        run: |
-          python3 - <<'PY'
-          import base64, json, os, urllib.request
-          url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"] + "&audience=sts.amazonaws.com"
-          req = urllib.request.Request(
-              url,
-              headers={"Authorization": "bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]},
-          )
-          token = json.load(urllib.request.urlopen(req))["value"]
-          payload = token.split(".")[1]
-          payload += "=" * (-len(payload) % 4)
-          claims = json.loads(base64.urlsafe_b64decode(payload))
-          keys = ("sub", "aud", "iss", "repository", "ref", "job_workflow_ref")
-          print(json.dumps({k: claims.get(k) for k in keys}, indent=2))
-          PY
-
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -62,9 +42,19 @@ jobs:
           IMAGE_TAG: ${{ github.sha }}
         run: |
           docker run -d --name api -p 8000:8000 "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
-          curl -fs --retry 10 --retry-connrefused --retry-delay 1 http://localhost:8000/health
+          # --retry-all-errors: el puerto puede aceptar la conexión antes de que
+          # uvicorn termine de arrancar (curl devuelve 56) y hay que reintentar.
+          curl -fs --retry 15 --retry-delay 1 --retry-all-errors http://localhost:8000/health
+          echo
           curl -fs http://localhost:8000/version
+          echo
           docker rm -f api
+
+      - name: Logs del contenedor (solo si el smoke test falla)
+        if: failure()
+        run: |
+          docker ps -a
+          docker logs api || true
 
       - name: Push image
         env:
