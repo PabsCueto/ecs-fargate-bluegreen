@@ -1,0 +1,257 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Notes API en ECS Fargate detras de un ALB, con despliegues blue/green
+  gestionados por CodeDeploy a traves del hook AWS::CodeDeploy::BlueGreen.
+
+Parameters:
+  Vpc:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC donde se crea todo (usamos la VPC por defecto).
+  Subnet1:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet publica en la AZ A.
+  Subnet2:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet publica en otra AZ (el ALB exige dos).
+  ImageUri:
+    Type: String
+    Description: URI completa de la imagen en ECR, con tag (el SHA del commit).
+  AppVersion:
+    Type: String
+    Default: 1.0.0
+    Description: Se expone en GET /version. Cambiarlo dispara un despliegue blue/green.
+  DeployColor:
+    Type: String
+    Default: blue
+    AllowedValues: [blue, green]
+    Description: Se expone en GET /version para ver el cambio de trafico.
+
+Transform:
+  - 'AWS::CodeDeployBlueGreen'
+
+Hooks:
+  CodeDeployBlueGreenHook:
+    Type: AWS::CodeDeploy::BlueGreen
+    Properties:
+      # Todo el trafico de golpe: el despliegue dura minutos (y cuesta menos).
+      # Para algo mas gradual: Type: TimeBasedCanary con
+      #   TimeBasedCanary: { StepPercentage: 15, BakeTimeMins: 5 }
+      TrafficRoutingConfig:
+        Type: AllAtOnce
+      AdditionalOptions:
+        # Minutos que se conserva el entorno viejo (blue) tras el cambio.
+        TerminationWaitTimeInMinutes: 1
+      Applications:
+        - Target:
+            Type: AWS::ECS::Service
+            LogicalID: EcsService
+          ECSAttributes:
+            TaskDefinitions:
+              - BlueTaskDefinition
+              - GreenTaskDefinition
+            TaskSets:
+              - BlueTaskSet
+              - GreenTaskSet
+            TrafficRouting:
+              ProdTrafficRoute:
+                Type: AWS::ElasticLoadBalancingV2::Listener
+                LogicalID: ListenerProd
+              TargetGroups:
+                - TargetGroupBlue
+                - TargetGroupGreen
+
+Resources:
+  # --- Red -----------------------------------------------------------------
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Entrada HTTP publica hacia el ALB
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Solo el ALB puede llegar a los contenedores
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+
+  # --- Load balancer: dos target groups (blue y green) ----------------------
+  TargetGroupBlue:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8000
+      VpcId: !Ref Vpc
+      HealthCheckPath: /health
+      HealthCheckPort: '8000'
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 10
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        # Por defecto el ALB espera 300 s al "drenar"; con 5 s los despliegues
+        # y el borrado del stack terminan mucho antes (y cuestan menos).
+        - Key: deregistration_delay.timeout_seconds
+          Value: '5'
+
+  TargetGroupGreen:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8000
+      VpcId: !Ref Vpc
+      HealthCheckPath: /health
+      HealthCheckPort: '8000'
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 10
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '5'
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      Subnets:
+        - !Ref Subnet1
+        - !Ref Subnet2
+
+  ListenerProd:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          ForwardConfig:
+            TargetGroups:
+              - TargetGroupArn: !Ref TargetGroupBlue
+                Weight: 1
+
+  # --- Logs (retencion minima para no acumular almacenamiento) --------------
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${AWS::StackName}'
+      RetentionInDays: 1
+
+  # --- ECS -----------------------------------------------------------------
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  BlueTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref AWS::StackName
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: '256'      # el minimo de Fargate (0.25 vCPU)
+      Memory: '512'   # el minimo para esa CPU
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: api
+          Image: !Ref ImageUri
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8000
+              HostPort: 8000
+              Protocol: tcp
+          Environment:
+            - Name: APP_VERSION
+              Value: !Ref AppVersion
+            - Name: DEPLOY_COLOR
+              Value: !Ref DeployColor
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: api
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+
+  EcsService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref Cluster
+      DesiredCount: 1
+      DeploymentController:
+        Type: EXTERNAL   # CodeDeploy controla los despliegues
+
+  BlueTaskSet:
+    Type: AWS::ECS::TaskSet
+    DependsOn: ListenerProd
+    Properties:
+      Cluster: !Ref Cluster
+      Service: !Ref EcsService
+      TaskDefinition: !Ref BlueTaskDefinition
+      LaunchType: FARGATE
+      PlatformVersion: 1.4.0
+      Scale:
+        Unit: PERCENT
+        Value: 100
+      NetworkConfiguration:
+        AwsVpcConfiguration:
+          # Subnets publicas + IP publica: asi las tareas bajan la imagen de ECR
+          # sin NAT gateway (que cobra por hora). El security group solo deja
+          # entrar trafico desde el ALB.
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref TaskSecurityGroup
+          Subnets:
+            - !Ref Subnet1
+            - !Ref Subnet2
+      LoadBalancers:
+        - ContainerName: api
+          ContainerPort: 8000
+          TargetGroupArn: !Ref TargetGroupBlue
+
+  PrimaryTaskSet:
+    Type: AWS::ECS::PrimaryTaskSet
+    Properties:
+      Cluster: !Ref Cluster
+      Service: !Ref EcsService
+      TaskSetId: !GetAtt BlueTaskSet.Id
+
+Outputs:
+  AlbUrl:
+    Description: URL publica de la API (HTTP)
+    Value: !Sub 'http://${LoadBalancer.DNSName}'
+  ClusterName:
+    Value: !Ref Cluster
