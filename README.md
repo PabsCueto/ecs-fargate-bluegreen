@@ -104,6 +104,29 @@ APP_VERSION=2.0.0 DEPLOY_COLOR=green ./scripts/deploy.sh
 ./scripts/teardown.sh
 ```
 
+## Verified deployment
+
+The stack was deployed in a short window and verified end to end, then destroyed with `./scripts/teardown.sh` (`check-costs.sh` reported nothing left running).
+
+Initial deployment (`APP_VERSION=1.0.0`, `DEPLOY_COLOR=blue`):
+
+```
+GET /health   -> {"status":"ok"}
+GET /version  -> {"version":"1.0.0","color":"blue","hostname":"ip-172-31-67-143.ec2.internal"}
+POST /notes   -> 201, note created
+```
+
+Blue/green update (`APP_VERSION=2.0.0`, `DEPLOY_COLOR=green`), which only changes the task definition:
+
+```
+GET /version  -> {"version":"2.0.0","color":"green","hostname":"ip-172-31-84-17.ec2.internal"}
+GET /notes    -> []   (notes lived in the memory of the previous container)
+```
+
+`aws ecs list-service-deployments` showed both deployments as `SUCCESSFUL`: the initial one took about 1 minute 25 seconds and the blue/green update about 2 minutes 25 seconds, including the 1-minute bake time. The hostname change shows that traffic moved to a different set of tasks.
+
+Not covered yet: a continuous request loop during the switch to measure downtime, and a test listener to validate the green version before the shift.
+
 ## Troubleshooting notes
 
 - **OIDC `Not authorized to perform sts:AssumeRoleWithWebIdentity`** even with a correct trust policy: the `sub` claim in this repository's token included immutable owner and repository IDs (`repo:<owner>@<id>/<repo>@<id>:ref:refs/heads/main`) instead of the classic `repo:<owner>/<repo>:ref:...` format. A temporary workflow step that decoded and printed the token claims revealed the real value; the trust policy now matches it exactly.
@@ -125,4 +148,4 @@ APP_VERSION=2.0.0 DEPLOY_COLOR=green ./scripts/deploy.sh
 - [x] FastAPI notes API
 - [x] CI: build, smoke test and push to ECR with OIDC
 - [x] CloudFormation template accepted by CloudFormation (change set preview)
-- [ ] Live deployment and blue/green switch verified end to end
+- [x] Live deployment and blue/green switch verified end to end
