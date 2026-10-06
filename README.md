@@ -1,6 +1,6 @@
 # ecs-fargate-bluegreen
 
-A small FastAPI notes API, containerized with Docker and deployed on **AWS ECS Fargate** behind an **Application Load Balancer**, with **blue/green deployments through CodeDeploy** (managed from CloudFormation). Images are built and pushed to **ECR** by **GitHub Actions** using **OIDC** (no long-lived AWS keys).
+A small FastAPI notes API, containerized with Docker and deployed on **AWS ECS Fargate** behind an **Application Load Balancer**, with **native ECS blue/green deployments** (defined in CloudFormation). Images are built and pushed to **ECR** by **GitHub Actions** using **OIDC** (no long-lived AWS keys).
 
 Built as an AWS Developer Associate (DVA-C02) portfolio project. It is designed to cost nothing while idle: the stack is created only for short deployment windows and destroyed afterwards.
 
@@ -16,9 +16,9 @@ flowchart LR
   subgraph AWS
     ALB --> TGB[Target group: blue]
     ALB -.-> TGG[Target group: green]
-    TGB --> Blue[Fargate task set: blue]
-    TGG --> Green[Fargate task set: green]
-    CD[CodeDeploy] -. shifts traffic .-> ALB
+    TGB --> Blue[Fargate tasks: blue, current]
+    TGG --> Green[Fargate tasks: green, new]
+    ECS[ECS service] -. shifts traffic .-> ALB
   end
   ECR --> Blue
   ECR --> Green
@@ -45,7 +45,7 @@ Dockerfile                Image definition (non-root user)
 .github/workflows/        CI: build, smoke test, push to ECR
 iam/                      OIDC trust policy and ECR push policy for the CI role
 ecr/lifecycle-policy.json Keep only the 5 most recent images
-infra/template.yaml       CloudFormation: ALB, ECS, CodeDeploy blue/green hook
+infra/template.yaml       CloudFormation: ALB, ECS service with native blue/green
 scripts/                  deploy.sh, teardown.sh, check-costs.sh
 ```
 
@@ -62,14 +62,16 @@ The role can only push to this one ECR repository; the single action with `Resou
 
 ## Infrastructure and blue/green
 
-`infra/template.yaml` uses the `AWS::CodeDeployBlueGreen` transform and the `AWS::CodeDeploy::BlueGreen` hook. Two target groups (blue and green) sit behind one listener. Changing the task definition (for example `AppVersion`) makes CloudFormation create the green task set, shift traffic through CodeDeploy, and retire the blue one after a short wait.
+`infra/template.yaml` defines an ECS service that uses the built-in `BLUE_GREEN` deployment strategy. Two target groups (blue and green) sit behind one listener, and a listener rule carries the production traffic. Changing the task definition (for example `AppVersion`) makes ECS start the new (green) tasks, wait for them to be healthy, shift the listener rule to the green target group, keep both versions for a short bake time, and then stop the old one. If the new version does not become healthy, the deployment circuit breaker rolls back automatically.
+
+An earlier version of this project used the CloudFormation `AWS::CodeDeploy::BlueGreen` hook. The AWS account's plan did not have access to CodeDeploy (`SubscriptionRequiredException`), so the project uses ECS's native blue/green strategy, which needs no additional service.
 
 Notable choices:
 
 - Tasks run in public subnets with a public IP and a security group that only accepts traffic from the ALB. This avoids a NAT gateway, which bills hourly.
 - Smallest Fargate size (0.25 vCPU, 0.5 GB), one task, log retention of one day.
-- Target group deregistration delay of 5 seconds so deployments and teardown finish quickly.
-- Traffic shifting is `AllAtOnce` to keep deployments short; a canary configuration is included as a comment in the template.
+- Target group deregistration delay of 5 seconds and a 1-minute bake time so deployments and teardown finish quickly.
+- Two IAM roles with separate purposes: the task execution role (pull image, write logs) and an ECS infrastructure role that lets ECS manage the load balancer during traffic shifts.
 
 ## Cost safety
 
@@ -105,6 +107,7 @@ APP_VERSION=2.0.0 DEPLOY_COLOR=green ./scripts/deploy.sh
 ## Troubleshooting notes
 
 - **OIDC `Not authorized to perform sts:AssumeRoleWithWebIdentity`** even with a correct trust policy: the `sub` claim in this repository's token included immutable owner and repository IDs (`repo:<owner>@<id>/<repo>@<id>:ref:refs/heads/main`) instead of the classic `repo:<owner>/<repo>:ref:...` format. A temporary workflow step that decoded and printed the token claims revealed the real value; the trust policy now matches it exactly.
+- **`SubscriptionRequiredException` from CodeDeploy**: the first stack creation succeeded but the CodeDeploy hook failed on update with "The AWS Access Key Id needs a subscription for the service". `aws deploy list-applications` returned the same error, which showed it was an account-level restriction and not a template problem. The design was changed to ECS native blue/green.
 - **Smoke test failing with curl exit code 56**: the published port accepts connections before uvicorn is ready. Fixed with `--retry-all-errors`, and the workflow now prints container logs when the smoke test fails.
 
 ## DVA-C02 mapping
@@ -113,7 +116,7 @@ APP_VERSION=2.0.0 DEPLOY_COLOR=green ./scripts/deploy.sh
 |----------|--------|
 | OIDC federation instead of access keys; trust policy scoped to repo and branch | Security |
 | Least-privilege ECR push policy, scan on push | Security |
-| CloudFormation with CodeDeploy blue/green, health-checked target groups | Deployment |
+| CloudFormation with ECS blue/green, health-checked target groups, circuit breaker rollback | Deployment |
 | CI pipeline with a smoke test gate before pushing the image | Deployment |
 | Container logs in CloudWatch Logs; failure logs surfaced in CI | Troubleshooting and monitoring |
 

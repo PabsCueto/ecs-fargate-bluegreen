@@ -67,7 +67,7 @@ aws cloudformation deploy \
   --region "$REGION" \
   --stack-name "$STACK_NAME" \
   --template-file infra/template.yaml \
-  --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND \
+  --capabilities CAPABILITY_IAM \
   --parameter-overrides \
       Vpc="$VPC_ID" Subnet1="$SUBNET1" Subnet2="$SUBNET2" \
       ImageUri="$IMAGE_URI" AppVersion="$APP_VERSION" DeployColor="$DEPLOY_COLOR" \
@@ -75,7 +75,6 @@ aws cloudformation deploy \
 
 if [ "$PREVIEW" -eq 0 ]; then
   echo
-  aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
-    --query 'Stacks[0].Outputs' --output table
+  "$(dirname "$0")/url.sh"
   echo "Recuerda: ./scripts/teardown.sh al terminar."
 fi

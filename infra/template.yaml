@@ -1,7 +1,7 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Notes API en ECS Fargate detras de un ALB, con despliegues blue/green
-  gestionados por CodeDeploy a traves del hook AWS::CodeDeploy::BlueGreen.
+  Notes API en ECS Fargate detras de un ALB, con despliegues blue/green nativos
+  de ECS (sin CodeDeploy).
 
 Parameters:
   Vpc:
@@ -25,40 +25,6 @@ Parameters:
     Default: blue
     AllowedValues: [blue, green]
     Description: Se expone en GET /version para ver el cambio de trafico.
-
-Transform:
-  - 'AWS::CodeDeployBlueGreen'
-
-Hooks:
-  CodeDeployBlueGreenHook:
-    Type: AWS::CodeDeploy::BlueGreen
-    Properties:
-      # Todo el trafico de golpe: el despliegue dura minutos (y cuesta menos).
-      # Para algo mas gradual: Type: TimeBasedCanary con
-      #   TimeBasedCanary: { StepPercentage: 15, BakeTimeMins: 5 }
-      TrafficRoutingConfig:
-        Type: AllAtOnce
-      AdditionalOptions:
-        # Minutos que se conserva el entorno viejo (blue) tras el cambio.
-        TerminationWaitTimeInMinutes: 1
-      Applications:
-        - Target:
-            Type: AWS::ECS::Service
-            LogicalID: EcsService
-          ECSAttributes:
-            TaskDefinitions:
-              - BlueTaskDefinition
-              - GreenTaskDefinition
-            TaskSets:
-              - BlueTaskSet
-              - GreenTaskSet
-            TrafficRouting:
-              ProdTrafficRoute:
-                Type: AWS::ElasticLoadBalancingV2::Listener
-                LogicalID: ListenerProd
-              TargetGroups:
-                - TargetGroupBlue
-                - TargetGroupGreen
 
 Resources:
   # --- Red -----------------------------------------------------------------
@@ -84,7 +50,7 @@ Resources:
           ToPort: 8000
           SourceSecurityGroupId: !Ref AlbSecurityGroup
 
-  # --- Load balancer: dos target groups (blue y green) ----------------------
+  # --- Load balancer: dos target groups (blue = actual, green = nueva) ------
   TargetGroupBlue:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
@@ -151,6 +117,29 @@ Resources:
             TargetGroups:
               - TargetGroupArn: !Ref TargetGroupBlue
                 Weight: 1
+              - TargetGroupArn: !Ref TargetGroupGreen
+                Weight: 0
+
+  # ECS necesita una *regla* de listener para mover el trafico de blue a green.
+  # Esta regla captura todas las rutas (/*); ECS cambia sus pesos durante el despliegue.
+  ListenerProdRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ListenerProd
+      Priority: 1
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - '/*'
+      Actions:
+        - Type: forward
+          ForwardConfig:
+            TargetGroups:
+              - TargetGroupArn: !Ref TargetGroupBlue
+                Weight: 1
+              - TargetGroupArn: !Ref TargetGroupGreen
+                Weight: 0
 
   # --- Logs (retencion minima para no acumular almacenamiento) --------------
   LogGroup:
@@ -159,7 +148,8 @@ Resources:
       LogGroupName: !Sub '/ecs/${AWS::StackName}'
       RetentionInDays: 1
 
-  # --- ECS -----------------------------------------------------------------
+  # --- IAM -----------------------------------------------------------------
+  # Rol de ejecucion: permite a Fargate bajar la imagen de ECR y escribir logs.
   TaskExecutionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -173,7 +163,24 @@ Resources:
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
 
-  BlueTaskDefinition:
+  # Rol de infraestructura: permite a ECS mover el trafico entre target groups.
+  EcsInfrastructureRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonECSInfrastructureRolePolicyForLoadBalancers
+
+  # --- ECS -----------------------------------------------------------------
+  # Cambiar cualquier propiedad de esta task definition (por ejemplo AppVersion)
+  # crea una revision nueva y dispara el despliegue blue/green del servicio.
+  TaskDefinition:
     Type: AWS::ECS::TaskDefinition
     Properties:
       Family: !Ref AWS::StackName
@@ -208,26 +215,27 @@ Resources:
 
   EcsService:
     Type: AWS::ECS::Service
-    Properties:
-      Cluster: !Ref Cluster
-      DesiredCount: 1
-      DeploymentController:
-        Type: EXTERNAL   # CodeDeploy controla los despliegues
-
-  BlueTaskSet:
-    Type: AWS::ECS::TaskSet
     DependsOn: ListenerProd
     Properties:
       Cluster: !Ref Cluster
-      Service: !Ref EcsService
-      TaskDefinition: !Ref BlueTaskDefinition
       LaunchType: FARGATE
       PlatformVersion: 1.4.0
-      Scale:
-        Unit: PERCENT
-        Value: 100
+      DesiredCount: 1
+      TaskDefinition: !Ref TaskDefinition
+      DeploymentController:
+        Type: ECS
+      DeploymentConfiguration:
+        Strategy: BLUE_GREEN
+        # Minutos que se conservan las dos versiones a la vez tras mover el trafico
+        # (la blue se apaga despues; mas minutos = mas costo).
+        BakeTimeInMinutes: 1
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true   # si la version nueva no queda sana, vuelve a la anterior
       NetworkConfiguration:
-        AwsVpcConfiguration:
+        AwsvpcConfiguration:
           # Subnets publicas + IP publica: asi las tareas bajan la imagen de ECR
           # sin NAT gateway (que cobra por hora). El security group solo deja
           # entrar trafico desde el ALB.
@@ -241,17 +249,12 @@ Resources:
         - ContainerName: api
           ContainerPort: 8000
           TargetGroupArn: !Ref TargetGroupBlue
-
-  PrimaryTaskSet:
-    Type: AWS::ECS::PrimaryTaskSet
-    Properties:
-      Cluster: !Ref Cluster
-      Service: !Ref EcsService
-      TaskSetId: !GetAtt BlueTaskSet.Id
+          AdvancedConfiguration:
+            AlternateTargetGroupArn: !Ref TargetGroupGreen
+            ProductionListenerRule: !Ref ListenerProdRule
+            RoleArn: !GetAtt EcsInfrastructureRole.Arn
 
 Outputs:
   AlbUrl:
     Description: URL publica de la API (HTTP)
     Value: !Sub 'http://${LoadBalancer.DNSName}'
-  ClusterName:
-    Value: !Ref Cluster
